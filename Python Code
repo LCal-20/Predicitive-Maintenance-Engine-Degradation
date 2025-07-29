@@ -1,0 +1,920 @@
+''' Code was AI assisted in generation then further refined, cleaned, and tested manually"""
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+import os
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set plotting style
+plt.style.use('seaborn-v0_8')
+sns.set_palette("husl")
+
+class CompleteTurbofanAnalysis:
+
+    def __init__(self, rul_cap=125):
+        """
+        Initialize the complete analysis system
+        Args:
+            rul_cap (int): Maximum RUL value for training (reduces noise)
+        """
+        self.rul_cap = rul_cap
+        self.model = None
+        self.scaler = None
+        self.feature_columns = None
+        self.feature_importance_ = None
+
+        # Data storage
+        self.train_data = None
+        self.test_data = None
+        self.test_rul = None
+
+        # Define column names for NASA turbofan data
+        self.columns = [
+            'engine_id', 'cycle', 'setting1', 'setting2', 'setting3'
+        ] + [f'sensor_{i}' for i in range(1, 22)]
+
+        print("🚁 NASA Turbofan RUL Prediction System Initialized")
+        print(f"   RUL cap set to: {rul_cap} cycles")
+
+    def load_data_file(self, file_path, file_type='train'):
+        """
+        Load a single NASA turbofan data file
+
+        Args:
+            file_path (str): Path to the data file
+            file_type (str): Type of file ('train', 'test', or 'rul')
+
+        Returns:
+            pandas.DataFrame: Loaded data
+        """
+        try:
+            if file_type == 'rul':
+                # RUL files have only one column
+                data = pd.read_csv(file_path, sep='\\s+', header=None, names=['RUL'])
+                data['engine_id'] = range(1, len(data) + 1)
+                print(f"✅ Loaded {file_type} file: {file_path}")
+                print(f"   Shape: {data.shape[0]} engines")
+            else:
+                # Training and test files have sensor data
+                data = pd.read_csv(file_path, sep='\\s+', header=None, names=self.columns)
+                print(f"✅ Loaded {file_type} file: {file_path}")
+                print(f"   Shape: {data.shape[0]} rows × {data.shape[1]} columns")
+                print(f"   Engines: {data['engine_id'].nunique()}")
+                print(f"   Total cycles: {data['cycle'].sum()}")
+
+            return data
+
+        except FileNotFoundError:
+            print(f"❌ File not found: {file_path}")
+            return None
+        except Exception as e:
+            print(f"❌ Error loading file {file_path}: {e}")
+            return None
+
+    def add_rul_to_training_data(self, data):
+        """
+        Calculate and add RUL column to training data
+
+        Args:
+            data (DataFrame): Training data
+
+        Returns:
+            DataFrame: Data with RUL column
+        """
+        if data is None:
+            return None
+
+        print("🔧 Calculating RUL for training data...")
+
+        # Calculate max cycle for each engine
+        max_cycles = data.groupby('engine_id')['cycle'].max()
+
+        # Add RUL column
+        data['RUL'] = data.apply(lambda row: max_cycles[row['engine_id']] - row['cycle'], axis=1)
+
+        print(f"   RUL range: {data['RUL'].min()} - {data['RUL'].max()}")
+
+        return data
+
+    def load_complete_dataset(self, data_directory, dataset_num=1):
+        """
+        Load complete dataset (train, test, RUL) from directory
+
+        Args:
+            data_directory (str): Path to data directory
+            dataset_num (int): Dataset number (1-4)
+
+        Returns:
+            bool: Success status
+        """
+        print(f"\\n📂 Loading Dataset FD00{dataset_num} from: {data_directory}")
+        print("=" * 60)
+
+        data_path = Path(data_directory)
+
+        # Check if directory exists
+        if not data_path.exists():
+            print(f"❌ Directory not found: {data_directory}")
+            return False
+
+        # Define file paths
+        train_file = data_path / f"train_FD00{dataset_num}.txt"
+        test_file = data_path / f"test_FD00{dataset_num}.txt"
+        rul_file = data_path / f"RUL_FD00{dataset_num}.txt"
+
+        # Load training data
+        self.train_data = self.load_data_file(train_file, 'train')
+        if self.train_data is not None:
+            self.train_data = self.add_rul_to_training_data(self.train_data)
+
+        # Load test data
+        self.test_data = self.load_data_file(test_file, 'test')
+
+        # Load RUL labels
+        rul_data = self.load_data_file(rul_file, 'rul')
+        if rul_data is not None:
+            self.test_rul = rul_data['RUL'].values
+
+        # Check if all data loaded successfully
+        success = all([
+            self.train_data is not None,
+            self.test_data is not None,
+            self.test_rul is not None
+        ])
+        if success:
+            print(f"\\n🎉 Successfully loaded complete dataset FD00{dataset_num}")
+            self.print_data_summary()
+        else:
+            print(f"\\n❌ Failed to load complete dataset")
+
+        return success
+
+    def print_data_summary(self):
+        """Print summary of loaded data"""
+        print("\\n📊 DATA SUMMARY")
+        print("-" * 30)
+
+        if self.train_data is not None:
+            print(f"Training Data:")
+            print(f"  • Engines: {self.train_data['engine_id'].nunique()}")
+            print(f"  • Total samples: {len(self.train_data)}")
+            print(f"  • RUL range: {self.train_data['RUL'].min()}-{self.train_data['RUL'].max()}")
+
+        if self.test_data is not None:
+            print(f"Test Data:")
+            print(f"  • Engines: {self.test_data['engine_id'].nunique()}")
+            print(f"  • Total samples: {len(self.test_data)}")
+
+        if self.test_rul is not None:
+            print(f"Test RUL Labels:")
+            print(f"  • Engines: {len(self.test_rul)}")
+            print(f"  • RUL range: {self.test_rul.min()}-{self.test_rul.max()}")
+
+    def create_advanced_features(self, data):
+        """
+        Create comprehensive engineered features
+
+        Args:
+            data (DataFrame): Raw data
+
+        Returns:
+            DataFrame: Data with engineered features
+        """
+        print("\\n🔧 Creating advanced features...")
+
+        # Sort data properly
+        data = data.sort_values(['engine_id', 'cycle']).reset_index(drop=True)
+
+        # Get sensor and setting columns
+        sensor_cols = [col for col in data.columns if 'sensor' in col]
+        setting_cols = [col for col in data.columns if 'setting' in col]
+
+        df_features = data.copy()
+
+        # 1. Rolling Statistics (capture degradation trends)
+        print("   • Adding rolling statistics...")
+        window_sizes = [3, 5, 7]
+
+        for sensor in sensor_cols[:8]:  # Focus on most important sensors
+            for window in window_sizes:
+                # Rolling mean
+                df_features[f'{sensor}_roll_mean_{window}'] = (
+                    df_features.groupby('engine_id')[sensor]
+                    .rolling(window=window, min_periods=1)
+                    .mean()
+                    .reset_index(drop=True)
+                )
+
+                # Rolling std (only for larger windows)
+                if window >= 5:
+                    df_features[f'{sensor}_roll_std_{window}'] = (
+                        df_features.groupby('engine_id')[sensor]
+                        .rolling(window=window, min_periods=1)
+                        .std()
+                        .fillna(0)
+                        .reset_index(drop=True)
+                    )
+
+        # 2. Degradation Indicators (baseline comparison)
+        print("   • Adding degradation indicators...")
+        for sensor in sensor_cols[:10]:
+            # Baseline (first 5 cycles average)
+            baseline = (
+                df_features.groupby('engine_id')[sensor]
+                .transform(lambda x: x.iloc[:min(5, len(x))].mean())
+            )
+
+            # Absolute and relative degradation
+            df_features[f'{sensor}_degradation'] = df_features[sensor] - baseline
+            df_features[f'{sensor}_deg_pct'] = (df_features[sensor] - baseline) / (baseline + 1e-8)
+
+        # 3. Trend Features (rate of change)
+        print("   • Adding trend features...")
+        for sensor in sensor_cols[:8]:
+            # Different period trends
+            for period in [1, 3, 5]:
+                df_features[f'{sensor}_trend_{period}'] = (
+                    df_features.groupby('engine_id')[sensor]
+                    .pct_change(periods=period)
+                    .fillna(0)
+                )
+
+        # 4. Cycle-based Features
+        print("   • Adding cycle-based features...")
+        # Normalized cycle position
+        df_features['cycle_norm'] = (
+            df_features.groupby('engine_id')['cycle']
+            .transform(lambda x: (x - x.min()) / (x.max() - x.min() + 1e-8))
+        )
+
+        # Cycle statistics
+        df_features['cycle_max'] = df_features.groupby('engine_id')['cycle'].transform('max')
+        df_features['cycle_remaining_pct'] = (df_features['cycle_max'] - df_features['cycle']) / df_features['cycle_max']
+
+        # 5. Cross-sensor Features (physics-based ratios)
+        print("   • Adding cross-sensor features...")
+        # Temperature ratios
+        if 'sensor_2' in sensor_cols and 'sensor_3' in sensor_cols:
+            df_features['temp_ratio_2_3'] = df_features['sensor_2'] / (df_features['sensor_3'] + 1e-8)
+
+        if 'sensor_7' in sensor_cols and 'sensor_9' in sensor_cols:
+            df_features['temp_ratio_7_9'] = df_features['sensor_7'] / (df_features['sensor_9'] + 1e-8)
+
+        # Pressure ratios
+        if 'sensor_4' in sensor_cols and 'sensor_11' in sensor_cols:
+            df_features['pressure_ratio_4_11'] = df_features['sensor_4'] / (df_features['sensor_11'] + 1e-8)
+
+        # Efficiency indicators
+        if 'sensor_8' in sensor_cols and 'sensor_13' in sensor_cols:
+            df_features['efficiency_8_13'] = df_features['sensor_8'] * df_features['sensor_13']
+
+        # 6. Statistical Features per Engine
+        print("   • Adding statistical features...")
+        for sensor in sensor_cols[:6]:
+            # Engine-level statistics
+            df_features[f'{sensor}_engine_mean'] = df_features.groupby('engine_id')[sensor].transform('mean')
+            df_features[f'{sensor}_engine_std'] = df_features.groupby('engine_id')[sensor].transform('std')
+            df_features[f'{sensor}_deviation'] = df_features[sensor] - df_features[f'{sensor}_engine_mean']
+
+        print(f"   ✅ Created {len(df_features.columns) - len(data.columns)} new features")
+        print(f"   📏 Total features: {len(df_features.columns)}")
+
+        return df_features
+
+    def select_best_features(self, data, target_col='RUL', n_features=25):
+        """
+        Select most predictive features using multiple criteria
+        """
+        print(f"\\n🎯 Selecting top {n_features} features...")
+
+        # Get feature columns
+        exclude_cols = ['engine_id', 'cycle', target_col, 'cycle_max']
+        feature_cols = [col for col in data.columns if col not in exclude_cols]
+
+        feature_scores = {}
+
+        for col in feature_cols:
+            # Skip if all values are the same
+            if data[col].nunique() <= 1:
+                continue
+
+            # Correlation with target
+            try:
+                corr = abs(data[col].corr(data[target_col]))
+                if np.isnan(corr):
+                    corr = 0
+            except:
+                corr = 0
+
+            # Coefficient of variation
+            mean_val = data[col].mean()
+            std_val = data[col].std()
+            cv = std_val / (abs(mean_val) + 1e-8) if abs(mean_val) > 1e-8 else 0
+
+            # Mutual information approximation (binned correlation)
+            try:
+                # Simple binning approach
+                bins = min(10, data[col].nunique())
+                if bins > 1:
+                    data_binned = pd.cut(data[col], bins=bins, duplicates='drop')
+                    mi_score = abs(data_binned.astype('category').cat.codes.corr(data[target_col]))
+                    if np.isnan(mi_score):
+                        mi_score = 0
+                else:
+                    mi_score = 0
+            except:
+                mi_score = 0
+
+            # Combined score
+            feature_scores[col] = (0.4 * corr + 0.3 * min(cv, 2.0) + 0.3 * mi_score)
+
+        # Select top features
+        selected_features = sorted(feature_scores.items(), key=lambda x: x[1], reverse=True)
+        selected_features = [feat[0] for feat in selected_features[:n_features]]
+
+        print(f"   🏆 Top 10 features:")
+        for i, feat in enumerate(selected_features[:10], 1):
+            print(f"      {i:2d}. {feat}")
+
+        return selected_features
+
+    def prepare_data_for_modeling(self, data, is_training=True):
+        """
+        Complete data preparation pipeline
+        """
+        print(f"\\n🔄 Preparing {'training' if is_training else 'test'} data...")
+
+        # Create advanced features
+        data_featured = self.create_advanced_features(data)
+
+        # Cap RUL for training
+        if is_training and 'RUL' in data_featured.columns:
+            original_max = data_featured['RUL'].max()
+            data_featured['RUL'] = np.minimum(data_featured['RUL'], self.rul_cap)
+            print(f"   📏 RUL capped from {original_max} to {self.rul_cap}")
+
+        # Select features
+        if is_training:
+            self.feature_columns = self.select_best_features(data_featured)
+
+        # Prepare feature matrix
+        X = data_featured[self.feature_columns].copy()
+
+        # Handle missing values
+        X = X.fillna(X.mean())
+
+        # Handle infinite values
+        X = X.replace([np.inf, -np.inf], np.nan).fillna(X.mean())
+
+        # Scale features
+        if is_training:
+            self.scaler = StandardScaler()
+            X_scaled = self.scaler.fit_transform(X)
+        else:
+            X_scaled = self.scaler.transform(X)
+
+        X_scaled = pd.DataFrame(X_scaled, columns=self.feature_columns, index=X.index)
+
+        print(f"   ✅ Prepared data shape: {X_scaled.shape}")
+
+        if is_training and 'RUL' in data_featured.columns:
+            y = data_featured['RUL'].values
+            return X_scaled, y
+        else:
+            return X_scaled
+
+    def create_engine_splits(self, data, test_size=0.2):
+        """
+        Create engine-based train/validation splits
+        """
+        unique_engines = data['engine_id'].unique()
+        n_val_engines = max(1, int(len(unique_engines) * test_size))
+
+        np.random.seed(42)
+        val_engines = np.random.choice(unique_engines, n_val_engines, replace=False)
+
+        train_idx = data[~data['engine_id'].isin(val_engines)].index
+        val_idx = data[data['engine_id'].isin(val_engines)].index
+
+        return train_idx, val_idx
+
+    def train_xgboost_model(self, hyperparameter_tuning=True):
+        """
+        Train XGBoost model with comprehensive setup
+        """
+        print("\\n🚀 Training XGBoost Model")
+        print("=" * 40)
+
+        if self.train_data is None:
+            print("❌ No training data loaded!")
+            return False
+
+        # Prepare data
+        X, y = self.prepare_data_for_modeling(self.train_data, is_training=True)
+
+        # Create validation split
+        train_idx, val_idx = self.create_engine_splits(self.train_data, test_size=0.2)
+
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
+
+        print(f"🔧 Data splits:")
+        print(f"   Training: {len(X_train)} samples, {self.train_data.iloc[train_idx]['engine_id'].nunique()} engines")
+        print(f"   Validation: {len(X_val)} samples, {self.train_data.iloc[val_idx]['engine_id'].nunique()} engines")
+
+        if hyperparameter_tuning:
+            print("\\n🎛️  Hyperparameter tuning...")
+
+            # Optimized parameter grid
+            param_combinations = [
+                {'max_depth': 4, 'learning_rate': 0.05, 'n_estimators': 300, 'subsample': 0.8, 'colsample_bytree': 0.8},
+                {'max_depth': 5, 'learning_rate': 0.05, 'n_estimators': 400, 'subsample': 0.8, 'colsample_bytree': 0.9},
+                {'max_depth': 4, 'learning_rate': 0.1, 'n_estimators': 200, 'subsample': 0.9, 'colsample_bytree': 0.8},
+                {'max_depth': 6, 'learning_rate': 0.03, 'n_estimators': 500, 'subsample': 0.8, 'colsample_bytree': 0.8},
+                {'max_depth': 5, 'learning_rate': 0.08, 'n_estimators': 250, 'subsample': 0.85, 'colsample_bytree': 0.85}
+            ]
+
+            best_score = float('inf')
+            best_params = None
+
+            for i, params in enumerate(param_combinations, 1):
+                print(f"   Testing combination {i}/{len(param_combinations)}...")
+
+                model_params = {
+                    **params,
+                    'objective': 'reg:squarederror',
+                    'random_state': 42,
+                    'reg_alpha': 0.1,
+                    'reg_lambda': 1.0
+                }
+
+                model = xgb.XGBRegressor(**model_params)
+                model.fit(X_train, y_train, verbose=False)
+
+                y_pred = model.predict(X_val)
+                score = mean_squared_error(y_val, y_pred)
+
+                if score < best_score:
+                    best_score = score
+                    best_params = model_params
+                    print(f"      ✅ New best RMSE: {np.sqrt(score):.2f}")
+
+            print(f"\\n🏆 Best validation RMSE: {np.sqrt(best_score):.2f}")
+            self.model = xgb.XGBRegressor(**best_params)
+
+        else:
+            # Use optimized default parameters
+            self.model = xgb.XGBRegressor(
+                max_depth=4,
+                learning_rate=0.05,
+                n_estimators=300,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.1,
+                reg_lambda=1.0,
+                objective='reg:squarederror',
+                random_state=42,
+                n_jobs=-1
+            )
+
+        # Train final model on all training data
+        print("\\n🔨 Training final model...")
+        self.model.fit(X, y, verbose=False)
+
+        # Store feature importance
+        self.feature_importance_ = pd.DataFrame({
+            'feature': self.feature_columns,
+            'importance': self.model.feature_importances_
+        }).sort_values('importance', ascending=False)
+
+        print("✅ Model training completed!")
+        return True
+
+    def make_predictions(self):
+        """
+        Make predictions on test data
+        """
+        if self.model is None:
+            print("❌ Model not trained!")
+            return None
+
+        if self.test_data is None:
+            print("❌ No test data loaded!")
+            return None
+
+        print("\\n🔮 Making predictions...")
+
+        # Prepare test data
+        X_test = self.prepare_data_for_modeling(self.test_data, is_training=False)
+
+        # Make predictions
+        predictions = self.model.predict(X_test)
+
+        # Ensure non-negative predictions
+        predictions = np.maximum(predictions, 0)
+
+        print(f"✅ Generated {len(predictions)} predictions")
+        print(f"   Prediction range: {predictions.min():.1f} - {predictions.max():.1f}")
+
+        return predictions
+
+    def evaluate_model(self):
+        """
+        Comprehensive model evaluation
+        """
+        if self.test_rul is None:
+            print("❌ No test RUL labels available!")
+            return None
+
+        print("\\n📊 Model Evaluation")
+        print("=" * 30)
+
+        # Get predictions
+        predictions = self.make_predictions()
+        if predictions is None:
+            return None
+
+        # For test data, we need predictions per engine (last cycle)
+        test_engines = self.test_data['engine_id'].unique()
+
+        # Get last prediction for each engine
+        engine_predictions = []
+        engine_true_rul = []
+
+        for engine_id in test_engines:
+            engine_data = self.test_data[self.test_data['engine_id'] == engine_id]
+            last_idx = engine_data.index[-1]  # Last cycle for this engine
+
+            # Find corresponding prediction
+            pred_idx = np.where(engine_data.index == last_idx)[0][0]
+            engine_predictions.append(predictions[pred_idx])
+            engine_true_rul.append(self.test_rul[engine_id - 1])  # RUL file is 0-indexed
+
+        engine_predictions = np.array(engine_predictions)
+        engine_true_rul = np.array(engine_true_rul)
+
+        # Calculate metrics
+        rmse = np.sqrt(mean_squared_error(engine_true_rul, engine_predictions))
+        mae = mean_absolute_error(engine_true_rul, engine_predictions)
+
+        # NASA scoring function
+        def nasa_score(y_true, y_pred):
+            errors = y_pred - y_true
+            score = 0
+            for error in errors:
+                if error < 0:  # Early prediction
+                    score += np.exp(-error/13) - 1
+                else:  # Late prediction
+                    score += np.exp(error/10) - 1
+            return score
+
+        nasa_score_val = nasa_score(engine_true_rul, engine_predictions)
+
+        # R-squared
+        ss_res = np.sum((engine_true_rul - engine_predictions) ** 2)
+        ss_tot = np.sum((engine_true_rul - np.mean(engine_true_rul)) ** 2)
+        r2 = 1 - (ss_res / ss_tot)
+
+        metrics = {
+            'RMSE': rmse,
+            'MAE': mae,
+            'NASA_Score': nasa_score_val,
+            'R2': r2,
+            'Predictions': engine_predictions,
+            'True_RUL': engine_true_rul
+        }
+
+        print(f"📈 Performance Metrics:")
+        print(f"   RMSE: {rmse:.2f} cycles")
+        print(f"   MAE:  {mae:.2f} cycles")
+        print(f"   R²:   {r2:.3f}")
+        print(f"   NASA Score: {nasa_score_val:.2f}")
+
+        # Performance categories
+        if rmse < 15:
+            print("   🏆 Excellent performance!")
+        elif rmse < 25:
+            print("   ✅ Good performance!")
+        elif rmse < 35:
+            print("   ⚠️  Fair performance")
+        else:
+            print("   ❌ Poor performance")
+
+        return metrics
+
+    def create_visualizations(self, metrics=None):
+        """
+        Create comprehensive visualizations
+        """
+        print("\\n📊 Creating visualizations...")
+
+        # 1. Feature Importance Plot
+        if self.feature_importance_ is not None:
+            plt.figure(figsize=(14, 8))
+            top_features = self.feature_importance_.head(15)
+
+            sns.barplot(data=top_features, x='importance', y='feature', palette='viridis')
+            plt.title('Top 15 Feature Importance', fontsize=16, fontweight='bold')
+            plt.xlabel('Importance Score', fontsize=12)
+            plt.ylabel('Features', fontsize=12)
+            plt.tight_layout()
+            plt.show()
+
+        # 2. Predictions vs Actual Plot
+        if metrics is not None and 'Predictions' in metrics:
+            plt.figure(figsize=(12, 8))
+
+            predictions = metrics['Predictions']
+            true_rul = metrics['True_RUL']
+
+            # Scatter plot
+            plt.subplot(2, 2, 1)
+            plt.scatter(true_rul, predictions, alpha=0.6, color='blue')
+            plt.plot([0, max(true_rul)], [0, max(true_rul)], 'r--', linewidth=2)
+            plt.xlabel('True RUL')
+            plt.ylabel('Predicted RUL')
+            plt.title('Predictions vs Actual RUL')
+            plt.grid(True, alpha=0.3)
+
+            # Residuals plot
+            plt.subplot(2, 2, 2)
+            residuals = predictions - true_rul
+            plt.scatter(true_rul, residuals, alpha=0.6, color='red')
+            plt.axhline(y=0, color='black', linestyle='--')
+            plt.xlabel('True RUL')
+            plt.ylabel('Residuals')
+            plt.title('Residuals Plot')
+            plt.grid(True, alpha=0.3)
+
+            # Error distribution
+            plt.subplot(2, 2, 3)
+            plt.hist(residuals, bins=20, alpha=0.7, color='green')
+            plt.xlabel('Prediction Error')
+            plt.ylabel('Frequency')
+            plt.title('Error Distribution')
+            plt.grid(True, alpha=0.3)
+
+            # Performance by RUL range
+            plt.subplot(2, 2, 4)
+            rul_ranges = ['0-25', '25-50', '50-100', '100+']
+            range_rmse = []
+
+            for i, (low, high) in enumerate([(0, 25), (25, 50), (50, 100), (100, 1000)]):
+                mask = (true_rul >= low) & (true_rul < high)
+                if np.sum(mask) > 0:
+                    rmse_range = np.sqrt(mean_squared_error(true_rul[mask], predictions[mask]))
+                    range_rmse.append(rmse_range)
+                else:
+                    range_rmse.append(0)
+
+            plt.bar(rul_ranges, range_rmse, color=['red', 'orange', 'yellow', 'green'])
+            plt.xlabel('RUL Range')
+            plt.ylabel('RMSE')
+            plt.title('RMSE by RUL Range')
+            plt.xticks(rotation=45)
+
+            plt.tight_layout()
+            plt.show()
+
+        # 3. Sample Engine Predictions (if we have cycle-by-cycle data)
+        if self.test_data is not None and metrics is not None:
+            # This would require more complex logic to show cycle-by-cycle predictions
+            print("   ✅ Visualization complete!")
+
+    def run_complete_analysis(self, data_directory, dataset_num=1, hyperparameter_tuning=True):
+        """
+        Run the complete analysis pipeline
+
+        Args:
+            data_directory (str): Path to data directory
+            dataset_num (int): Dataset number (1-4)
+            hyperparameter_tuning (bool): Whether to tune hyperparameters
+        """
+        print("\\n" + "="*60)
+        print("🚁 COMPLETE NASA TURBOFAN RUL ANALYSIS")
+        print("="*60)
+
+        # Step 1: Load Data
+        success = self.load_complete_dataset(data_directory, dataset_num)
+        if not success:
+            print("❌ Failed to load data. Analysis terminated.")
+            return None
+
+        # Step 2: Train Model
+        success = self.train_xgboost_model(hyperparameter_tuning)
+        if not success:
+            print("❌ Failed to train model. Analysis terminated.")
+            return None
+
+        # Step 3: Evaluate Model
+        metrics = self.evaluate_model()
+        if metrics is None:
+            print("❌ Failed to evaluate model.")
+            return None
+
+        # Step 4: Create Visualizations
+        self.create_visualizations(metrics)
+
+        print("\\n" + "="*60)
+        print("🎉 ANALYSIS COMPLETE!")
+        print("="*60)
+
+        return metrics
+
+
+def main():
+    """
+    Main function to run the complete analysis with user input
+    """
+    print("\\n" + "🚁"*20)
+    print("NASA TURBOFAN ENGINE RUL PREDICTION SYSTEM")
+    print("Complete Data Import + XGBoost Analysis")
+    print("🚁"*20)
+
+    print("\\nThis system will:")
+    print("1. 📂 Import NASA turbofan data from your directory")
+    print("2. 🔧 Engineer advanced features automatically")
+    print("3. 🎯 Select the most predictive features")
+    print("4. 🚀 Train an optimized XGBoost model")
+    print("5. 📊 Evaluate performance with multiple metrics")
+    print("6. 📈 Generate comprehensive visualizations")
+
+    # Get user input for data directory
+    print("\\n" + "-"*50)
+    print("STEP 1: DATA DIRECTORY INPUT")
+    print("-"*50)
+
+    while True:
+        data_directory = input("\\nEnter the path to your NASA turbofan data directory: ").strip()
+
+        if not data_directory:
+            print("❌ Please enter a valid directory path.")
+            continue
+
+        if not os.path.exists(data_directory):
+            print(f"❌ Directory not found: {data_directory}")
+            print("Please check the path and try again.")
+            continue
+
+        # Check if directory contains expected files
+        expected_files = []
+        for i in range(1, 5):
+            for file_type in ['train', 'test', 'RUL']:
+                expected_files.append(f"{file_type}_FD00{i}.txt")
+
+        found_files = []
+        for file in os.listdir(data_directory):
+            if file in expected_files:
+                found_files.append(file)
+
+        if not found_files:
+            print(f"❌ No NASA turbofan files found in: {data_directory}")
+            print("Expected files like: train_FD001.txt, test_FD001.txt, RUL_FD001.txt")
+            continue
+
+        print(f"✅ Found {len(found_files)} NASA turbofan files")
+        break
+
+    # Get dataset selection
+    print("\\n" + "-"*50)
+    print("STEP 2: DATASET SELECTION")
+    print("-"*50)
+
+    available_datasets = []
+    for i in range(1, 5):
+        train_file = os.path.join(data_directory, f"train_FD00{i}.txt")
+        test_file = os.path.join(data_directory, f"test_FD00{i}.txt")
+        rul_file = os.path.join(data_directory, f"RUL_FD00{i}.txt")
+
+        if all(os.path.exists(f) for f in [train_file, test_file, rul_file]):
+            available_datasets.append(i)
+
+    print(f"\\nAvailable complete datasets: {available_datasets}")
+
+    while True:
+        try:
+            dataset_num = int(input(f"\\nSelect dataset number {available_datasets}: "))
+            if dataset_num in available_datasets:
+                break
+            else:
+                print(f"❌ Please select from available datasets: {available_datasets}")
+        except ValueError:
+            print("❌ Please enter a valid number.")
+
+    # Get hyperparameter tuning preference
+    print("\\n" + "-"*50)
+    print("STEP 3: TRAINING OPTIONS")
+    print("-"*50)
+
+    while True:
+        tune_choice = input("\\nEnable hyperparameter tuning? (y/n) [recommended: y]: ").strip().lower()
+        if tune_choice in ['y', 'yes', '']:
+            hyperparameter_tuning = True
+            print("✅ Hyperparameter tuning enabled (may take longer but better results)")
+            break
+        elif tune_choice in ['n', 'no']:
+            hyperparameter_tuning = False
+            print("✅ Using optimized default parameters (faster)")
+            break
+        else:
+            print("❌ Please enter 'y' for yes or 'n' for no.")
+
+    # Run the complete analysis
+    print("\\n" + "="*60)
+    print("🚀 STARTING ANALYSIS...")
+    print("="*60)
+
+    # Initialize analyzer
+    analyzer = CompleteTurbofanAnalysis(rul_cap=125)
+
+    # Run complete analysis
+    try:
+        metrics = analyzer.run_complete_analysis(
+            data_directory=data_directory,
+            dataset_num=dataset_num,
+            hyperparameter_tuning=hyperparameter_tuning
+        )
+
+        if metrics:
+            print("\\n" + "🎯"*20)
+            print("FINAL RESULTS SUMMARY")
+            print("🎯"*20)
+            print(f"Dataset: FD00{dataset_num}")
+            print(f"RMSE: {metrics['RMSE']:.2f} cycles")
+            print(f"MAE: {metrics['MAE']:.2f} cycles")
+            print(f"R²: {metrics['R2']:.3f}")
+            print(f"NASA Score: {metrics['NASA_Score']:.2f}")
+
+            # Save results
+            results_df = pd.DataFrame({
+                'Engine_ID': range(1, len(metrics['True_RUL']) + 1),
+                'True_RUL': metrics['True_RUL'],
+                'Predicted_RUL': metrics['Predictions'],
+                'Error': metrics['Predictions'] - metrics['True_RUL']
+            })
+
+            output_file = f"turbofan_results_FD00{dataset_num}.csv"
+            results_df.to_csv(output_file, index=False)
+            print(f"\\n💾 Results saved to: {output_file}")
+
+            # Feature importance
+            if analyzer.feature_importance_ is not None:
+                importance_file = f"feature_importance_FD00{dataset_num}.csv"
+                analyzer.feature_importance_.to_csv(importance_file, index=False)
+                print(f"💾 Feature importance saved to: {importance_file}")
+
+        else:
+            print("❌ Analysis failed. Please check your data and try again.")
+
+    except Exception as e:
+        print(f"❌ An error occurred during analysis: {e}")
+        print("Please check your data files and try again.")
+
+    print("\\n" + "="*60)
+    print("Thank you for using NASA Turbofan RUL Prediction System!")
+    print("="*60)
+
+
+# Interactive example for demonstration
+def run_example_analysis():
+    """
+    Example function showing how to use the system programmatically
+    """
+    print("\\n" + "="*50)
+    print("EXAMPLE: HOW TO USE THE SYSTEM")
+    print("="*50)
+
+    # Example usage
+    data_directory = "/path/to/your/nasa/data"  # Replace with actual path
+    dataset_num = 1
+
+    print(f"\\n# Example code to run complete analysis:")
+    print(f"analyzer = CompleteTurbofanAnalysis(rul_cap=125)")
+    print(f"metrics = analyzer.run_complete_analysis(")
+    print(f"    data_directory='{data_directory}',")
+    print(f"    dataset_num={dataset_num},")
+    print(f"    hyperparameter_tuning=True")
+    print(f")")
+
+    print("\\n# Or step by step:")
+    print("analyzer = CompleteTurbofanAnalysis()")
+    print("analyzer.load_complete_dataset('/path/to/data', 1)")
+    print("analyzer.train_xgboost_model(hyperparameter_tuning=True)")
+    print("metrics = analyzer.evaluate_model()")
+    print("analyzer.create_visualizations(metrics)")
+
+
+if __name__ == "__main__":
+    import sys
+
+    # Check if running interactively
+    if len(sys.argv) > 1 and sys.argv[1] == "--example":
+        run_example_analysis()
+    else:
+        main()
